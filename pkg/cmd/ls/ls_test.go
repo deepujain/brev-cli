@@ -3,9 +3,11 @@ package ls
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	nodev1connect "buf.build/gen/go/brevdev/devplane/connectrpc/go/devplaneapi/v1/devplaneapiv1connect"
@@ -712,6 +714,15 @@ func TestOutputWorkspacesJSON_NoNodes(t *testing.T) {
 
 type lsFakeNodeService struct {
 	nodev1connect.UnimplementedExternalNodeServiceHandler
+	// getNodeStatus, when set, is returned as ConnectivityInfo.Status by GetNode.
+	getNodeStatus nodev1.NetworkMemberStatus
+	// failNodeID, when set, makes GetNode return an error for that node.
+	failNodeID string
+	// getNodeCalls counts GetNode invocations.
+	getNodeCalls atomic.Int64
+	// maxInFlightGetNode tracks peak concurrent GetNode handlers.
+	maxInFlightGetNode atomic.Int64
+	inFlightGetNode    atomic.Int64
 }
 
 func (f *lsFakeNodeService) ListNodes(_ context.Context, req *connect.Request[nodev1.ListNodesRequest]) (*connect.Response[nodev1.ListNodesResponse], error) {
@@ -726,6 +737,31 @@ func (f *lsFakeNodeService) ListNodes(_ context.Context, req *connect.Request[no
 	}), nil
 }
 
+func (f *lsFakeNodeService) GetNode(_ context.Context, req *connect.Request[nodev1.GetNodeRequest]) (*connect.Response[nodev1.GetNodeResponse], error) {
+	if req.Msg.GetExternalNodeId() == f.failNodeID {
+		return nil, connect.NewError(connect.CodeNotFound, fmt.Errorf("node %s not found", req.Msg.GetExternalNodeId()))
+	}
+	f.getNodeCalls.Add(1)
+	inFlight := f.inFlightGetNode.Add(1)
+	defer f.inFlightGetNode.Add(-1)
+	for {
+		max := f.maxInFlightGetNode.Load()
+		if inFlight <= max || f.maxInFlightGetNode.CompareAndSwap(max, inFlight) {
+			break
+		}
+	}
+	return connect.NewResponse(&nodev1.GetNodeResponse{
+		ExternalNode: &nodev1.ExternalNode{
+			Name:           "enriched-" + req.Msg.GetExternalNodeId(),
+			ExternalNodeId: req.Msg.GetExternalNodeId(),
+			OrganizationId: "org1",
+			ConnectivityInfo: &nodev1.ConnectivityInfo{
+				Status: f.getNodeStatus,
+			},
+		},
+	}), nil
+}
+
 func withFakeNodeAPI(t *testing.T, fn func()) {
 	t.Helper()
 	_, handler := nodev1connect.NewExternalNodeServiceHandler(&lsFakeNodeService{})
@@ -733,6 +769,67 @@ func withFakeNodeAPI(t *testing.T, fn func()) {
 	t.Cleanup(server.Close)
 	t.Setenv("BREV_PUBLIC_API_URL", server.URL)
 	fn()
+}
+
+func withFakeNodeAPIService(t *testing.T, svc *lsFakeNodeService, fn func()) {
+	t.Helper()
+	_, handler := nodev1connect.NewExternalNodeServiceHandler(svc)
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	t.Setenv("BREV_PUBLIC_API_URL", server.URL)
+	fn()
+}
+
+// TestRunNodes_EnrichesConnectivity verifies brev ls nodes shows the live
+// GetNode status, not the list-provided "Unknown".
+func TestRunNodes_EnrichesConnectivity(t *testing.T) {
+	term := terminal.New()
+
+	t.Run("GetNode status wins over list status", func(t *testing.T) {
+		svc := &lsFakeNodeService{getNodeStatus: nodev1.NetworkMemberStatus_NETWORK_MEMBER_STATUS_CONNECTED}
+		withFakeNodeAPIService(t, svc, func() {
+			ls := NewLs(newTestStore(), term, false)
+			if err := ls.RunNodes(&entity.Organization{ID: "org1", Name: "org1"}); err != nil {
+				t.Fatalf("RunNodes: %v", err)
+			}
+			if svc.getNodeCalls.Load() != 2 {
+				t.Fatalf("expected 2 GetNode calls, got %d", svc.getNodeCalls.Load())
+			}
+		})
+	})
+
+	t.Run("at most 5 GetNode calls in flight", func(t *testing.T) {
+		svc := &lsFakeNodeService{getNodeStatus: nodev1.NetworkMemberStatus_NETWORK_MEMBER_STATUS_CONNECTED}
+		withFakeNodeAPIService(t, svc, func() {
+			ls := NewLs(newTestStore(), term, false)
+			nodes := make([]*nodev1.ExternalNode, 13)
+			for i := range nodes {
+				nodes[i] = &nodev1.ExternalNode{ExternalNodeId: fmt.Sprintf("en-%d", i)}
+			}
+			_ = ls.enrichNodesWithConnectivity(context.Background(), nodes)
+			if svc.getNodeCalls.Load() != 13 {
+				t.Fatalf("expected 13 GetNode calls, got %d", svc.getNodeCalls.Load())
+			}
+			if max := svc.maxInFlightGetNode.Load(); max > 5 {
+				t.Fatalf("peak concurrent GetNode calls = %d, want <= 5", max)
+			}
+		})
+	})
+
+	t.Run("GetNode failure keeps node with Unknown status", func(t *testing.T) {
+		svc := &lsFakeNodeService{getNodeStatus: nodev1.NetworkMemberStatus_NETWORK_MEMBER_STATUS_CONNECTED, failNodeID: "en-missing"}
+		withFakeNodeAPIService(t, svc, func() {
+			ls := NewLs(newTestStore(), term, false)
+			nodes := []*nodev1.ExternalNode{{ExternalNodeId: "en-missing"}}
+			got := ls.enrichNodesWithConnectivity(context.Background(), nodes)
+			if len(got) != 1 || got[0] != nodes[0] {
+				t.Fatalf("expected original node retained, got %+v", got)
+			}
+			if status := nodeConnectionStatus(got[0]); status != "Unknown" {
+				t.Fatalf("expected Unknown status on failed enrichment, got %q", status)
+			}
+		})
+	})
 }
 
 // TestRunLs_ShowAllJSON_WithNodes verifies --all includes nodes from listNodes.
@@ -757,8 +854,8 @@ func TestRunLs_ShowAllJSON_WithNodes(t *testing.T) {
 			if err := json.Unmarshal([]byte(out), &res); err != nil {
 				t.Fatalf("parse JSON: %v\n%s", err, out)
 			}
-			if len(res.Nodes) != 2 || res.Nodes[0].Name != "gpu-node-1" {
-				t.Fatalf("expected 2 nodes from listNodes, got %+v", res.Nodes)
+			if len(res.Nodes) != 2 || res.Nodes[0].Name != "enriched-en-123" {
+				t.Fatalf("expected 2 enriched nodes from listNodes, got %+v", res.Nodes)
 			}
 		})
 	})
